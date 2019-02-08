@@ -23,6 +23,7 @@ import glob
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import os
+import tensorflow.contrib.rnn as rnn
 
 batch_s = 64
 def pitch_to_onehot(pitch):
@@ -186,217 +187,109 @@ def eager(filenames, batch_size, sequence_size):
         #full.append(dataset[33:65])
     return full
 
-def eager_autoencoder():
-    learning_rate = 0.001
-    num_steps = 1000
-    batch_size = 100
-    display_step = 20
-    examples_to_shop = 10
-
-    num_hidden_1 = 128  # 1st layer num features
-    num_hidden_2 = 16  # 2nd layer num features (the latent dim)
-    num_input = 128  # MNIST data input (img shape: 28*28)
-
-    # tf Graph input (only pictures)
-    # X = tf.placeholder("float", [None, num_input])
-
+def init_data(batch_size,sequence_size):
     files = glob.glob(".\\midi\\bach\\test" + '/**/*.mid', recursive=True)
     print(files)
-    test = eager(files, 64, 64)
+    data = eager(files, batch_size, sequence_size)
     print("DATA PROCESSING COMPLETE")
-    # Construct model
-    model, init = model_layers(None, None,True)
-    train_writer = tf.contrib.summary.create_file_writer('./log/good_smallbatch',flush_millis=1000)
+    return data
+
+def init_model(checkpoint_dir, learning_rate, restore, single_model):
+    model = model_layers(single_model)
     optimizer = tf.train.AdamOptimizer(learning_rate)
     root = tf.train.Checkpoint(optimizer=optimizer,
                                model=model,
                                optimizer_step=tf.train.get_or_create_global_step())
-    checkpoint_dir = './log/model/good_smallbatch/'
-    checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
-    #root.restore(tf.train.latest_checkpoint(checkpoint_dir))
+    #checkpoint_dir = './log/model/good_smallbatch/'
+    if restore:
+        root.restore(tf.train.latest_checkpoint(checkpoint_dir))
+    return model,optimizer,root
+
+def eager_autoregressive(checkpoint_dir):
+    learning_rate = 0.001
+    num_steps = 1000
+    batch_size = 64
+    sequence_size = 64
+    display_step = 20
+
+    data = init_data(batch_size, sequence_size)
+    model, optimizer, root = init_model(checkpoint_dir, learning_rate, True)
+    train_writer = tf.contrib.summary.create_file_writer('./log/good_smallbatch', flush_millis=1000)
     for epoch in range(num_steps):
-        avg_loss = 0
-        size = len(test)
-        for index in range(0,size):
+        for index in range(0, len(data)):
             with tf.GradientTape() as tape:
-                #t = test[0][i]
-                current_pred, new_states = tf.nn.dynamic_rnn(model, test[index], dtype=tf.float64)
-                #
+                current_pred, new_states = tf.nn.dynamic_rnn(model, data[index], dtype=tf.float64)
                 # # Prediction
                 y_pred = current_pred
-                #y_pred = current_pred.numpy()
-                # for i,batch in enumerate(y_pred):
-                #     for j,seq in enumerate(batch):
-                #         y_pred[i,j] = multiply(seq)
-
-                #model, init = model_layers(None,None,False)
-                #current_pred, new_states = tf.nn.dynamic_rnn(model, y_pred, dtype=tf.float64)
-                #y_pred = tf.nn.softmax(y_pred)
-                #matrix = tf.reshape(y_pred, [y_pred.shape[0] * y_pred.shape[1], 128])
-                #np.savetxt("test.txt", matrix.numpy())
                 # # Targets (Labels) are the input data.
-                y_true = test[index]
-                #
+                y_true = data[index]
+                # # Define loss and optimizer, minimize the squared error
+                loss = tf.losses.softmax_cross_entropy(y_true, y_pred)
+                grads = tape.gradient(loss, model.trainable_variables)
+                optimizer.apply_gradients(zip(grads, model.trainable_variables))
+                with train_writer.as_default(), tf.contrib.summary.always_record_summaries():
+                    tf.contrib.summary.scalar("loss", loss, step=epoch)
+                print(epoch, loss)
+        if epoch % display_step == 0:
+            checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
+            root.save(checkpoint_prefix)
+
+
+def eager_autoencoder(checkpoint_dir):
+    learning_rate = 0.001
+    num_steps = 1000
+    batch_size = 64
+    sequence_size = 64
+    display_step = 20
+
+    data = init_data(batch_size,sequence_size)
+    model,optimizer,root = init_model(checkpoint_dir,learning_rate,True)
+    train_writer = tf.contrib.summary.create_file_writer('./log/good_smallbatch', flush_millis=1000)
+    for epoch in range(num_steps):
+        for index in range(0,len(data)):
+            with tf.GradientTape() as tape:
+                current_pred, new_states = tf.nn.dynamic_rnn(model, data[index], dtype=tf.float64)
+                # # Prediction
+                y_pred = current_pred
+                # # Targets (Labels) are the input data.
+                y_true = data[index]
                 # # Define loss and optimizer, minimize the squared error
                 loss = tf.losses.softmax_cross_entropy(y_true, y_pred)
                 grads = tape.gradient(loss,model.trainable_variables)
                 optimizer.apply_gradients(zip(grads,model.trainable_variables))
                 with train_writer.as_default(), tf.contrib.summary.always_record_summaries():
-                    tf.contrib.summary.scalar("loss", loss, step=index)
-                    tf.contrib.summary.scalar("step", index, step=index)
+                    tf.contrib.summary.scalar("loss", loss, step=epoch)
                 print(epoch,loss)
-        if epoch % 20 == 0:
-            checkpoint_dir = './log/model/good_smallbatch/'
+        if epoch % display_step == 0:
             checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
             root.save(checkpoint_prefix)
-            matrix = tf.reshape(y_pred, [current_pred.shape[0] * current_pred.shape[1], 128])
-            t = matrix[0].numpy()
-            # matrix = tf.argmax(current_pred,dimension=2)
-            # matrix = tf.reshape(matrix,[-1])
-            #np.savetxt("test_multfiles.txt",matrix)
-    np.savetxt("test_smallbatch.txt", matrix)
-    # matrix = tf.reshape(y_pred, [current_pred.shape[0] * current_pred.shape[1], 128])
-    # t = matrix[0].numpy()
-    # # matrix = tf.argmax(current_pred,dimension=2)
-    # # matrix = tf.reshape(matrix,[-1])
-    # Y = tf.one_hot(tf.argmax(matrix, dimension=1), depth=128)
-    # yt = Y[0].numpy()
-    # # piano_roll_to_midi(Y,20)
-    # plot_sequences(Y)
-    # #Y = Y[..., :-1]
-    # #Y = np.asarray([fgt[0:-1] for fgt in Y])
-    # piano_roll_to_midi(Y,20,"bach_compare_goodt.mid")
 
+def save_prediction_to_file(y_pred):
+    y_pred = tf.nn.softmax(y_pred)
+    matrix = tf.reshape(y_pred, [y_pred.shape[0] * y_pred.shape[1], 128])
+    np.savetxt("test.txt", matrix.numpy())
 
-            #             print('Step %i: Minibatch Loss: %f' % (i, l))
-    # init_op = iterator.initializer
-    # init_val = tf.global_variables_initializer()
-    # saver = tf.train.Saver()
-    # # Start Training
-    # # Start a new TF session
-    # with tf.Session() as sess:
-    #
-    #     # Run the initializer
-    #     train_writer = tf.summary.FileWriter('./log',
-    #                                          sess.graph)
-    #     sess.run(init_op)
-    #     sess.run(init_val)
-    #     # Training
-    #     states = np.zeros((3, 2, 64, 128))
-    #     for i in range(1, num_steps + 1):
-    #         # Run optimization op (backprop) and cost op (to get loss value)
-    #         merge = tf.summary.merge_all()
-    #         summary, _, l, f = sess.run([merge, optimizer, loss, p])
-    #         # Display logs per step
-    #         if i % display_step == 0 or i == 1:
-    #             print('Step %i: Minibatch Loss: %f' % (i, l))
-    #         train_writer.add_summary(summary, i)
-    #     save_model(sess)
-
-def autoencoder():
-    learning_rate = 0.0001
-    num_steps = 3000
-    batch_size = 100
-    display_step = 20
-    examples_to_shop = 10
-
-    num_hidden_1 = 128 # 1st layer num features
-    num_hidden_2 = 16 # 2nd layer num features (the latent dim)
-    num_input = 128 # MNIST data input (img shape: 28*28)
-
-    # tf Graph input (only pictures)
-    #X = tf.placeholder("float", [None, num_input])
-
-    files = glob.glob(".\\midi" + '/**/*.mid', recursive=True)
-    print(files)
-    test = eager(files, 64, 64)
-    iterator = test.make_initializable_iterator()
-    roll = iterator.get_next()
-    p = tf.print(roll[0][0])
-    # Construct model
-    init_state = tf.placeholder(tf.float64, [3, 2, 64, 128])
-    model,init = model_layers(roll,init_state)
-    current_pred, new_states = tf.nn.dynamic_rnn(model, roll, dtype=tf.float64,initial_state=init)
-    #
-    # # Prediction
-    y_pred = current_pred
-    # # Targets (Labels) are the input data.
-    y_true = roll
-    #
-    # # Define loss and optimizer, minimize the squared error
-    loss = tf.losses.softmax_cross_entropy(roll,y_pred)
-    tf.summary.scalar("loss",loss)
-    optimizer = tf.train.AdamOptimizer(learning_rate).minimize(loss)
-    init_op = iterator.initializer
-    init_val= tf.global_variables_initializer()
-    saver = tf.train.Saver()
-    # Start Training
-    # Start a new TF session
-    with tf.Session() as sess:
-
-        # Run the initializer
-        train_writer = tf.summary.FileWriter('./log',
-                                             sess.graph)
-        sess.run(init_op)
-        sess.run(init_val)
-        # Training
-        states = np.zeros((3, 2, 64, 128))
-        for i in range(1, num_steps + 1):
-            # Run optimization op (backprop) and cost op (to get loss value)
-            merge = tf.summary.merge_all()
-            summary,_,l,f= sess.run([merge,optimizer,loss,p])
-            # Display logs per step
-            if i % display_step == 0 or i == 1:
-                print('Step %i: Minibatch Loss: %f' % (i, l))
-            train_writer.add_summary(summary,i)
-        save_model(sess)
-
-def model_layers(x,init,enc):
-      # None is for batch_size
-    #
-    # state_per_layer_list = tf.unstack(init, axis=0)
-    # #
-    # rnn_tuple_state = tuple(
-    #     [tf.contrib.rnn.LSTMStateTuple(state_per_layer_list[idx][0],
-    #                                    state_per_layer_list[idx][1])
-    #      for idx in range(3)]
-    # )
-    # cell_state = tf.placeholder(tf.float32, [64, 128])
-    # hidden_state = tf.placeholder(tf.float32, [64, 128])
-    # init_state = tf.nn.rnn_cell.LSTMStateTuple(cell_state, hidden_state)
-    #rnn_tuple_state = tf.nn.rnn_cell.LSTMCell(128).zero_state(64,dtype=tf.float64)
-    #
-    # #multi = tf.nn.rnn_cell.MultiRNNCell([lstm_cell(size) for size in [256, 256, 256]], state_is_tuple=True)
-    #cell = tf.contrib.rnn.MultiRNNCell([lstm_cell(size) for size in [128,256,256,16,256,256,128]])
-    # if enc:
-    #     cell = tf.contrib.rnn.MultiRNNCell([lstm_cell(size) for size in [128,32]])
-    # else:
-    #     cell = tf.contrib.rnn.MultiRNNCell([lstm_cell(size) for size in [32,128]])
-    cell = tf.contrib.rnn.MultiRNNCell([lstm_cell(size) for size in [128,32,128]])
-    init = cell.zero_state(32, tf.float64)
-    return cell,init
+def model_layers(single):
+    if single:
+        return tf.contrib.rnn.MultiRNNCell([lstm_cell(size) for size in [128,32,128]])
+    else:
+        return [rnn.MultiRNNCell([lstm_cell(size) for size in [128,32]]),rnn.MultiRNNCell([lstm_cell(size) for size in [32,128]])]
 
 def lstm_cell(state_value):
     cell = tf.nn.rnn_cell.LSTMCell(num_units=state_value, state_is_tuple=True)
     cell = tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=0.8)
-    # if state_value == 32:
-    #     t1 = np.linspace(1,0,16,endpoint=False)
-    #     t2 = np.linspace(0,1,16)
-    #     t3 = np.append(t1,t2)
-    #     cell = tf.math.multiply(cell,t3)
     return cell
 
-def multiply(t):
+def multiply(z_data):
+    z_data = z_data.numpy()
+    for i,batch in enumerate(z_data):
+        for j,seq in enumerate(batch):
+            z_data[i,j] = multiply(seq)
     t1 = np.linspace(1,0,16,endpoint=False)
     t2 = np.linspace(0,1,16)
     t3 = np.append(t1,t2)
-    test = tf.math.multiply(t,t3)
+    test = tf.math.multiply(z_data,t3)
     return test
-
-def save_model(sess):
-    tf.saved_model.simple_save(
-        sess, 'log/model/test/model.ckpt',
-    )
 
 def load_model():
     c = np.loadtxt("test.txt")
@@ -415,23 +308,7 @@ def load_model():
     #Y = Y[..., :-1]
     #Y = np.asarray([fgt[0:-1] for fgt in Y])
     piano_roll_to_midi(Y,10,"bach_compare_goodsall10.mid")
-    # model, init = model_layers(None, None)
-    # checkpoint_dir = './log/model/test/'
-    # checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
-    # root = tf.train.Checkpoint(model=model,
-    #                            )
-    # root.restore(tf.train.latest_checkpoint(checkpoint_prefix))
-    # files = glob.glob(".\\midi\\bach\\test" + '/**/*.mid', recursive=True)
-    # test = eager(files, 64, 64)
-    # init = model.zero_state(64, tf.float64)
-    # current_pred, new_states = tf.nn.dynamic_rnn(model, test[0], dtype=tf.float64)
-    # matrix = tf.reshape(current_pred,[current_pred.shape[0]*current_pred.shape[1],129])
-    # # matrix = tf.argmax(current_pred,dimension=2)
-    # # matrix = tf.reshape(matrix,[-1])
-    # Y = tf.one_hot(tf.argmax(matrix, dimension=1), depth=129)
-    # #piano_roll_to_midi(Y,20)
-    # plot_sequences(Y)
-    # print(tf.losses.softmax_cross_entropy(test[0],current_pred))
+
 
 tf.enable_eager_execution()
 #autoencoder()
