@@ -55,6 +55,7 @@ def plot_sequences(roll):
     # 'nearest' interpolation - faithful but blocky
     plt.imshow(tf.transpose(roll),aspect='auto')
     plt.ylim([0,128])
+    plt.xlim([0,100])
     plt.show()
 
 def piano_roll_sequences(filenames, batch_size, sequence_size, rate=10):
@@ -194,8 +195,8 @@ def init_data(batch_size,sequence_size):
     print("DATA PROCESSING COMPLETE")
     return data
 
-def init_model(checkpoint_dir, learning_rate, restore, single_model):
-    model = model_layers(single_model)
+def init_encoder(checkpoint_dir, learning_rate, restore):
+    model = model_layers(True)
     optimizer = tf.train.AdamOptimizer(learning_rate)
     root = tf.train.Checkpoint(optimizer=optimizer,
                                model=model,
@@ -205,34 +206,60 @@ def init_model(checkpoint_dir, learning_rate, restore, single_model):
         root.restore(tf.train.latest_checkpoint(checkpoint_dir))
     return model,optimizer,root
 
+def init_decoder(checkpoint_dir,learning_rate,restore):
+    model = model_layers(False)
+    optimizer = tf.train.AdamOptimizer(learning_rate)
+    root = tf.train.Checkpoint(optimizer=optimizer,
+                               model=model,
+                               optimizer_step=tf.train.get_or_create_global_step())
+    # checkpoint_dir = './log/model/good_smallbatch/'
+    if restore:
+        root.restore(tf.train.latest_checkpoint(checkpoint_dir))
+    return model, optimizer, root
+
 def eager_autoregressive(checkpoint_dir):
     learning_rate = 0.001
-    num_steps = 1000
+    num_steps = 10000
     batch_size = 64
     sequence_size = 64
     display_step = 20
 
     data = init_data(batch_size, sequence_size)
-    model, optimizer, root = init_model(checkpoint_dir, learning_rate, True)
-    train_writer = tf.contrib.summary.create_file_writer('./log/good_smallbatch', flush_millis=1000)
+    encoder_model, encoder_optimizer, encoder_root = init_encoder(checkpoint_dir, learning_rate, False)
+    decoder_model, decoder_optimizer, decoder_root = init_decoder(checkpoint_dir, learning_rate, False)
+    train_writer = tf.contrib.summary.create_file_writer('./log/autoregressive', flush_millis=1000)
     for epoch in range(num_steps):
         for index in range(0, len(data)):
             with tf.GradientTape() as tape:
-                current_pred, new_states = tf.nn.dynamic_rnn(model, data[index], dtype=tf.float64)
+                #encoder
+                z_output, new_states = tf.nn.dynamic_rnn(encoder_model, data[index], dtype=tf.float64)
+                #enc_tape.watch(encoder_model.trainable_variables)
+                #concatenation
+                data_rel = data[index]
+                matrix = tf.reshape(data_rel, [data_rel.shape[0] * data_rel.shape[1], 128])
+                shifted_output = np.roll(matrix, 1,axis=0).reshape((data_rel.shape[0],data_rel.shape[1],128))
+                decoder_input = concatenate(z_output,shifted_output)
+                #decoder
+                current_prediction, new_states = tf.nn.dynamic_rnn(decoder_model,decoder_input,dtype=tf.float64)
+                #dec_tape.watch(decoder_model.trainable_variables)
                 # # Prediction
-                y_pred = current_pred
+                y_pred = current_prediction
                 # # Targets (Labels) are the input data.
                 y_true = data[index]
                 # # Define loss and optimizer, minimize the squared error
                 loss = tf.losses.softmax_cross_entropy(y_true, y_pred)
-                grads = tape.gradient(loss, model.trainable_variables)
-                optimizer.apply_gradients(zip(grads, model.trainable_variables))
+                # grads_encoder = enc_tape.gradient(loss, encoder_model.trainable_variables)
+                # encoder_optimizer.apply_gradients(zip(grads_encoder, encoder_model.trainable_variables))
+                grads_decoder = tape.gradient(loss, decoder_model.trainable_variables)
+                decoder_optimizer.apply_gradients(zip(grads_decoder, decoder_model.trainable_variables))
                 with train_writer.as_default(), tf.contrib.summary.always_record_summaries():
                     tf.contrib.summary.scalar("loss", loss, step=epoch)
                 print(epoch, loss)
         if epoch % display_step == 0:
-            checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
-            root.save(checkpoint_prefix)
+            enc_checkpoint_prefix = os.path.join(checkpoint_dir+"/enc", "ckpt")
+            dec_checkpoint_prefix = os.path.join(checkpoint_dir+"/dec", "ckpt")
+            encoder_root.save(enc_checkpoint_prefix)
+            decoder_root.save(dec_checkpoint_prefix)
 
 
 def eager_autoencoder(checkpoint_dir):
@@ -269,11 +296,11 @@ def save_prediction_to_file(y_pred):
     matrix = tf.reshape(y_pred, [y_pred.shape[0] * y_pred.shape[1], 128])
     np.savetxt("test.txt", matrix.numpy())
 
-def model_layers(single):
-    if single:
-        return tf.contrib.rnn.MultiRNNCell([lstm_cell(size) for size in [128,32,128]])
+def model_layers(encoder):
+    if encoder:
+        return tf.contrib.rnn.MultiRNNCell([lstm_cell(size) for size in [128,32]])
     else:
-        return [rnn.MultiRNNCell([lstm_cell(size) for size in [128,32]]),rnn.MultiRNNCell([lstm_cell(size) for size in [32,128]])]
+        return tf.contrib.rnn.MultiRNNCell([lstm_cell(size) for size in [160,128]])
 
 def lstm_cell(state_value):
     cell = tf.nn.rnn_cell.LSTMCell(num_units=state_value, state_is_tuple=True)
@@ -291,12 +318,52 @@ def multiply(z_data):
     test = tf.math.multiply(z_data,t3)
     return test
 
-def load_model():
-    c = np.loadtxt("test.txt")
+def concatenate(z_vector, data):
+    z_vector = z_vector.numpy()
+    concatenated = np.zeros((64,64,160))
+    for i, batch in enumerate(data):
+        for j, seq in enumerate(batch):
+            concatenated[i,j] = np.concatenate((seq,z_vector[i,j]))
+    return concatenated
+
+def generate(batch_size,sequence_size):
+    checkpoint_dir = "./log/model/autoregressive"
+    learning_rate = 0.001
+    encoder_model, encoder_optimizer, encoder_root = init_encoder(checkpoint_dir+"/enc", learning_rate, True)
+    decoder_model, decoder_optimizer, decoder_root = init_decoder(checkpoint_dir+"/dec", learning_rate, True)
+    data = init_data(batch_size,sequence_size)
+    z_output, states = tf.nn.dynamic_rnn(encoder_model,data[0],dtype=tf.float64)
+    input_matrix = np.zeros((batch_size,sequence_size,128))
+    #data_rel = data[0]
+    #matrix = tf.reshape(data_rel, [data_rel.shape[0] * data_rel.shape[1], 128])
+    #input_matrix = np.roll(matrix, 1, axis=0).reshape((data_rel.shape[0], data_rel.shape[1], 128))
+    for index in range(0,10):
+        decoder_input = concatenate(z_output, input_matrix)
+        output, dec_states = tf.nn.dynamic_rnn(decoder_model,decoder_input,dtype=tf.float64)
+        output = tf.nn.softmax(output)
+        output = tf.reshape(output,[output.shape[0]*output.shape[1],128])
+        #load_data(output.numpy())
+        preds = np.log(output.numpy()) / 0.8
+        exp_preds = np.exp(preds)
+        preds = exp_preds / np.sum(exp_preds)
+        probas = np.random.multinomial(1,preds[index+1],1)
+       # probas = np.random.choice(np.arange(0,128),p=output[index+1].numpy())
+        input_matrix = tf.reshape(input_matrix, [batch_size * sequence_size, 128]).numpy()
+        #input_matrix[index+1] = tf.one_hot(probas,depth=128)
+        input_matrix[index+1] = probas
+        input_matrix = tf.reshape(tf.convert_to_tensor(input_matrix), [batch_size,sequence_size,128])
+        print("Generating data: ",index, " from 1000")
+    print(input_matrix)
+    load_data(tf.reshape(input_matrix,[batch_size * sequence_size, 128]).numpy())
+
+
+
+def load_data(data):
+    #c = np.loadtxt("test.txt")
     # piano_roll_to_midi(Y,20)
     newarray = []
-    for index,val in enumerate(c):
-        if max(val) > -10:
+    for index,val in enumerate(data):
+        if max(val) > 0:
             newarray.append(tf.argmax(val))
         else:
             newarray.append(-1)
@@ -312,5 +379,7 @@ def load_model():
 
 tf.enable_eager_execution()
 #autoencoder()
-eager_autoencoder()
+#eager_autoencoder()
 #load_model()
+#eager_autoregressive("./log/model/autoregressive")
+generate(64,64)
