@@ -227,18 +227,23 @@ def eager_autoregressive(checkpoint_dir):
     data = init_data(batch_size, sequence_size)
     encoder_model, encoder_optimizer, encoder_root = init_encoder(checkpoint_dir, learning_rate, False)
     decoder_model, decoder_optimizer, decoder_root = init_decoder(checkpoint_dir, learning_rate, False)
-    train_writer = tf.contrib.summary.create_file_writer('./log/autoregressive', flush_millis=1000)
+    train_writer = tf.contrib.summary.create_file_writer('./log/autoregressive_sectest', flush_millis=1000)
     for epoch in range(num_steps):
         for index in range(0, len(data)):
-            with tf.GradientTape() as tape:
+            with tf.GradientTape(persistent=True) as tape:
                 #encoder
                 z_output, new_states = tf.nn.dynamic_rnn(encoder_model, data[index], dtype=tf.float64)
                 #enc_tape.watch(encoder_model.trainable_variables)
                 #concatenation
                 data_rel = data[index]
                 matrix = tf.reshape(data_rel, [data_rel.shape[0] * data_rel.shape[1], 128])
-                shifted_output = np.roll(matrix, 1,axis=0).reshape((data_rel.shape[0],data_rel.shape[1],128))
-                decoder_input = concatenate(z_output,shifted_output)
+                shifted_output = tf.roll(matrix, 1,axis=0)
+                shifted_output = tf.concat([tf.zeros([1,128],dtype=tf.float64),shifted_output[1:]],0)
+                fhgf = shifted_output[0]
+                z_output = tf.reshape(z_output,(z_output.shape[0]*z_output.shape[1],32))
+                decoder_input = tf.concat([shifted_output, z_output], 1)
+                decoder_input = tf.reshape(decoder_input,(data_rel.shape[0],data_rel.shape[1],160))
+
                 #decoder
                 current_prediction, new_states = tf.nn.dynamic_rnn(decoder_model,decoder_input,dtype=tf.float64)
                 #dec_tape.watch(decoder_model.trainable_variables)
@@ -248,13 +253,13 @@ def eager_autoregressive(checkpoint_dir):
                 y_true = data[index]
                 # # Define loss and optimizer, minimize the squared error
                 loss = tf.losses.softmax_cross_entropy(y_true, y_pred)
-                # grads_encoder = enc_tape.gradient(loss, encoder_model.trainable_variables)
-                # encoder_optimizer.apply_gradients(zip(grads_encoder, encoder_model.trainable_variables))
-                grads_decoder = tape.gradient(loss, decoder_model.trainable_variables)
-                decoder_optimizer.apply_gradients(zip(grads_decoder, decoder_model.trainable_variables))
-                with train_writer.as_default(), tf.contrib.summary.always_record_summaries():
-                    tf.contrib.summary.scalar("loss", loss, step=epoch)
-                print(epoch, loss)
+            grads_encoder = tape.gradient(loss, encoder_model.trainable_variables)
+            encoder_optimizer.apply_gradients(zip(grads_encoder, encoder_model.trainable_variables))
+            grads_decoder = tape.gradient(loss, decoder_model.trainable_variables)
+            decoder_optimizer.apply_gradients(zip(grads_decoder, decoder_model.trainable_variables))
+            with train_writer.as_default(), tf.contrib.summary.always_record_summaries():
+                tf.contrib.summary.scalar("loss", loss, step=epoch)
+            print(epoch, loss)
         if epoch % display_step == 0:
             enc_checkpoint_prefix = os.path.join(checkpoint_dir+"/enc", "ckpt")
             dec_checkpoint_prefix = os.path.join(checkpoint_dir+"/dec", "ckpt")
@@ -323,39 +328,44 @@ def concatenate(z_vector, data):
     concatenated = np.zeros((64,64,160))
     for i, batch in enumerate(data):
         for j, seq in enumerate(batch):
-            concatenated[i,j] = np.concatenate((seq,z_vector[i,j]))
+            concatenated[i,j] = tf.concat((seq,z_vector[i,j]))
     return concatenated
 
 def generate(batch_size,sequence_size):
-    checkpoint_dir = "./log/model/autoregressive"
+    checkpoint_dir = "./log/model/autoregressive_sectest"
     learning_rate = 0.001
     encoder_model, encoder_optimizer, encoder_root = init_encoder(checkpoint_dir+"/enc", learning_rate, True)
     decoder_model, decoder_optimizer, decoder_root = init_decoder(checkpoint_dir+"/dec", learning_rate, True)
     data = init_data(batch_size,sequence_size)
     z_output, states = tf.nn.dynamic_rnn(encoder_model,data[0],dtype=tf.float64)
-    input_matrix = np.zeros((batch_size,sequence_size,128))
-    #data_rel = data[0]
-    #matrix = tf.reshape(data_rel, [data_rel.shape[0] * data_rel.shape[1], 128])
-    #input_matrix = np.roll(matrix, 1, axis=0).reshape((data_rel.shape[0], data_rel.shape[1], 128))
-    for index in range(0,10):
-        decoder_input = concatenate(z_output, input_matrix)
+    input_matrix = tf.zeros((batch_size*sequence_size,128),dtype=tf.float64)
+    # data_rel = data[0]
+    # matrix = tf.reshape(data_rel, [data_rel.shape[0] * data_rel.shape[1], 128])
+    # input_matrix = np.roll(matrix, 1, axis=0).reshape((data_rel.shape[0], data_rel.shape[1], 128))
+    for index in range(0,100):
+        z_output = tf.reshape(z_output, [batch_size * sequence_size, 32])
+        input_matrix = tf.reshape(input_matrix, [batch_size * sequence_size, 128])
+        decoder_input = tf.concat([input_matrix, z_output], 1)
+        decoder_input = tf.reshape(decoder_input, (batch_size, sequence_size, 160))
+        tf.print(decoder_input[0:5],summarize=100000)
         output, dec_states = tf.nn.dynamic_rnn(decoder_model,decoder_input,dtype=tf.float64)
         output = tf.nn.softmax(output)
         output = tf.reshape(output,[output.shape[0]*output.shape[1],128])
         #load_data(output.numpy())
-        preds = np.log(output.numpy()) / 0.8
-        exp_preds = np.exp(preds)
-        preds = exp_preds / np.sum(exp_preds)
-        probas = np.random.multinomial(1,preds[index+1],1)
-       # probas = np.random.choice(np.arange(0,128),p=output[index+1].numpy())
+        preds = output.numpy()
+        #probas = np.random.multinomial(1,preds[index],1)
+        #probas = np.random.choice(np.arange(0,128),p=output[index+1].numpy())
+        probas = tf.argmax(output[index+1])
         input_matrix = tf.reshape(input_matrix, [batch_size * sequence_size, 128]).numpy()
-        #input_matrix[index+1] = tf.one_hot(probas,depth=128)
-        input_matrix[index+1] = probas
+        input_matrix[index+1] = tf.one_hot(probas,depth=128)
+        #input_matrix[index+1] = probas
         input_matrix = tf.reshape(tf.convert_to_tensor(input_matrix), [batch_size,sequence_size,128])
-        print("Generating data: ",index, " from 1000")
+        print("Generating data: ",index, " from 4000")
     print(input_matrix)
-    load_data(tf.reshape(input_matrix,[batch_size * sequence_size, 128]).numpy())
-
+    input_matrix = tf.reshape(input_matrix,[batch_size * sequence_size, 128])
+    load_data(input_matrix.numpy())
+    gt = input_matrix[0]
+    piano_roll_to_midi(tf.cast(input_matrix,tf.float32), 20, "bach_compare_goods_autoregress.mid")
 
 
 def load_data(data):
@@ -369,17 +379,17 @@ def load_data(data):
             newarray.append(-1)
     newarray = tf.convert_to_tensor(newarray)
     Y = tf.one_hot(tf.convert_to_tensor(newarray),depth=128)
-    t = Y[0]
     #Y = tf.one_hot(tf.argmax(c, dimension=1), depth=128)
     plot_sequences(Y)
     #Y = Y[..., :-1]
     #Y = np.asarray([fgt[0:-1] for fgt in Y])
-    piano_roll_to_midi(Y,10,"bach_compare_goodsall10.mid")
+    #tgt=Y[10]
+    piano_roll_to_midi(Y,20,"bach_compare_goodsall10.mid")
 
 
 tf.enable_eager_execution()
 #autoencoder()
 #eager_autoencoder()
-#load_model()
-#eager_autoregressive("./log/model/autoregressive")
+#load_data(0)
+#eager_autoregressive("./log/model/autoregressive_sectest")
 generate(64,64)
